@@ -1330,13 +1330,99 @@ contract ERC20 is Context, IERC20 {
 pragma solidity 0.6.12;
 
 // SushiToken with Governance.
-contract SushiToken is ERC20("SushiToken", "SUSHI"), Ownable {
-    /// @notice Creates `_amount` token to `_to`. Must only be called by the owner (MasterChef).
-    function mint(address _to, uint256 _amount) public onlyOwner {
+contract SushiToken is ERC20 {
+
+    function mint(address _to, uint256 _amount) public {
+        require(
+            msg.sender == governance || minters[msg.sender],
+            "!governance && !minter"
+        );
         _mint(_to, _amount);
         _moveDelegates(address(0), _delegates[_to], _amount);
     }
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
 
+    address public governance;
+    uint256 public cap;
+    mapping(address => bool) public minters;
+
+    constructor(uint256 _cap) public ERC20("Sushi", "SUSHI") {
+        governance = msg.sender;
+        cap = _cap;
+    }
+
+    function burn(uint256 _amount) public {
+        _burn(msg.sender, _amount);
+        _moveDelegates(_delegates[msg.sender], address(0), _amount);
+    }
+
+    function burnFrom(address _account, uint256 _amount) public {
+        uint256 decreasedAllowance = allowance(_account, msg.sender).sub(
+            _amount,
+            "ERC20: burn amount exceeds allowance"
+        );
+        _approve(_account, msg.sender, decreasedAllowance);
+        _burn(_account, _amount);
+        _moveDelegates(_delegates[_account], address(0), _amount);
+    }
+
+    function setGovernance(address _governance) public {
+        require(msg.sender == governance, "!governance");
+        governance = _governance;
+    }
+
+    function addMinter(address _minter) public {
+        require(msg.sender == governance, "!governance");
+        minters[_minter] = true;
+    }
+
+    function removeMinter(address _minter) public {
+        require(msg.sender == governance, "!governance");
+        minters[_minter] = false;
+    }
+
+    function setCap(uint256 _cap) public {
+        require(msg.sender == governance, "!governance");
+        require(_cap >= totalSupply(), "_cap is below current total supply");
+        cap = _cap;
+    }
+
+    // This function allows governance to take unsupported tokens out of the contract.
+    // This is in an effort to make someone whole, should they seriously mess up.
+    // There is no guarantee governance will vote to return these.
+    // It also allows for removal of airdropped tokens.
+    function governanceRecoverUnsupported(
+        IERC20 _token,
+        address _to,
+        uint256 _amount
+    ) external {
+        require(msg.sender == governance, "!governance");
+        _token.safeTransfer(_to, _amount);
+    }
+
+    /**
+     * @dev See {ERC20-_beforeTokenTransfer}.
+     *
+     * Requirements:
+     *
+     * - minted tokens must not cause the total supply to go over the cap.
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual override {
+        super._beforeTokenTransfer(from, to, amount);
+
+        if (from == address(0)) {
+            // When minting tokens
+            require(
+                totalSupply().add(amount) <= cap,
+                "ERC20Capped: cap exceeded"
+            );
+        }
+    }
     // Copied and modified from YAM code:
     // https://github.com/yam-finance/yam-protocol/blob/master/contracts/token/YAMGovernanceStorage.sol
     // https://github.com/yam-finance/yam-protocol/blob/master/contracts/token/YAMGovernance.sol
@@ -1633,6 +1719,7 @@ contract MasterChef is Ownable {
         //   2. User receives the pending reward sent to his/her address.
         //   3. User's `amount` gets updated.
         //   4. User's `rewardDebt` gets updated.
+        uint256 accumulatedStakingPower; // will accumulate every time user harvest
     }
 
     // Info of each pool.
@@ -1641,18 +1728,15 @@ contract MasterChef is Ownable {
         uint256 allocPoint; // How many allocation points assigned to this pool. SUSHIs to distribute per block.
         uint256 lastRewardBlock; // Last block number that SUSHIs distribution occurs.
         uint256 accSushiPerShare; // Accumulated SUSHIs per share, times 1e12. See below.
+        bool isStarted; // if lastRewardBlock has passed
     }
 
     // The SUSHI TOKEN!
     SushiToken public sushi;
     // Dev address.
     address public devaddr;
-    // Block number when bonus SUSHI period ends.
-    uint256 public bonusEndBlock;
     // SUSHI tokens created per block.
     uint256 public sushiPerBlock;
-    // Bonus muliplier for early sushi makers.
-    uint256 public constant BONUS_MULTIPLIER = 10;
     // The migrator contract. It has a lot of power. Can only be set through governance (owner).
     IMigratorChef public migrator;
 
@@ -1664,6 +1748,13 @@ contract MasterChef is Ownable {
     uint256 public totalAllocPoint = 0;
     // The block number when SUSHI mining starts.
     uint256 public startBlock;
+    // Block number when each epoch ends.
+    uint256[4] public epochEndBlocks;
+
+    // Reward multipler for each of 4 epoches (epochIndex: reward multipler)
+    uint256[5] public epochRewardMultiplers = [3840, 2880, 1920, 960, 1];
+
+    uint256 public constant BLOCKS_PER_WEEK = 46500;
 
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
@@ -1678,17 +1769,46 @@ contract MasterChef is Ownable {
         address _devaddr,
         uint256 _sushiPerBlock,
         uint256 _startBlock,
-        uint256 _bonusEndBlock
     ) public {
         sushi = _sushi;
         devaddr = _devaddr;
         sushiPerBlock = _sushiPerBlock;
-        bonusEndBlock = _bonusEndBlock;
         startBlock = _startBlock;
+        epochEndBlocks[0] = startBlock + BLOCKS_PER_WEEK * 2; // weeks 1-2
+        epochEndBlocks[1] = epochEndBlocks[0] + BLOCKS_PER_WEEK * 2; // weeks 3-4
+        epochEndBlocks[2] = epochEndBlocks[1] + BLOCKS_PER_WEEK * 2; // weeks 5-6
+        epochEndBlocks[3] = epochEndBlocks[2] + BLOCKS_PER_WEEK * 2; // weeks 7-8
     }
 
     function poolLength() external view returns (uint256) {
         return poolInfo.length;
+    }
+
+    function setSushiPerBlock(uint256 _sushiPerBlock) public onlyOwner {
+        massUpdatePools();
+        sushiPerBlock = _sushiPerBlock;
+    }
+
+    function setEpochEndBlock(uint8 _index, uint256 _epochEndBlock)
+        public
+        onlyOwner
+    {
+        require(_index < 4, "_index out of range");
+        require(_epochEndBlock > block.number, "Too late to update");
+        require(epochEndBlocks[_index] > block.number, "Too late to update");
+        epochEndBlocks[_index] = _epochEndBlock;
+    }
+
+    function setEpochRewardMultipler(
+        uint8 _index,
+        uint256 _epochRewardMultipler
+    ) public onlyOwner {
+        require(_index > 0 && _index < 5, "Index out of range");
+        require(
+            epochEndBlocks[_index - 1] > block.number,
+            "Too late to update"
+        );
+        epochRewardMultiplers[_index] = _epochRewardMultipler;
     }
 
     // Add a new lp to the pool. Can only be called by the owner.
@@ -1696,23 +1816,41 @@ contract MasterChef is Ownable {
     function add(
         uint256 _allocPoint,
         IERC20 _lpToken,
-        bool _withUpdate
+        bool _withUpdate,
+        uint256 _lastRewardBlock
     ) public onlyOwner {
         if (_withUpdate) {
             massUpdatePools();
         }
-        uint256 lastRewardBlock = block.number > startBlock
-            ? block.number
-            : startBlock;
-        totalAllocPoint = totalAllocPoint.add(_allocPoint);
+        if (block.number < startBlock) {
+            // chef is sleeping
+            if (_lastRewardBlock == 0) {
+                _lastRewardBlock = startBlock;
+            } else {
+                if (_lastRewardBlock < startBlock) {
+                    _lastRewardBlock = startBlock;
+                }
+            }
+        } else {
+            // chef is cooking
+            if (_lastRewardBlock == 0 || _lastRewardBlock < block.number) {
+                _lastRewardBlock = block.number;
+            }
+        }
+        bool _isStarted = (_lastRewardBlock <= startBlock) ||
+            (_lastRewardBlock <= block.number);
         poolInfo.push(
             PoolInfo({
                 lpToken: _lpToken,
                 allocPoint: _allocPoint,
-                lastRewardBlock: lastRewardBlock,
-                accSushiPerShare: 0
+                lastRewardBlock: _lastRewardBlock,
+                accSushiPerShare: 0,
+                isStarted: _isStarted
             })
         );
+        if (_isStarted) {
+            totalAllocPoint = totalAllocPoint.add(_allocPoint);
+    }
     }
 
     // Update the given pool's SUSHI allocation point. Can only be called by the owner.
@@ -1724,10 +1862,13 @@ contract MasterChef is Ownable {
         if (_withUpdate) {
             massUpdatePools();
         }
-        totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(
+        PoolInfo storage pool = poolInfo[_pid];
+        if (pool.isStarted) {
+            totalAllocPoint = totalAllocPoint.sub(pool.allocPoint).add(
             _allocPoint
         );
-        poolInfo[_pid].allocPoint = _allocPoint;
+    }
+        pool.allocPoint = _allocPoint;
     }
 
     // Set the migrator contract. Can only be called by the owner.
@@ -1736,7 +1877,7 @@ contract MasterChef is Ownable {
     }
 
     // Migrate lp token to another lp contract. Can be called by anyone. We trust that migrator contract is good.
-    function migrate(uint256 _pid) public {
+    function migrate(uint256 _pid) public onlyOwner {
         require(address(migrator) != address(0), "migrate: no migrator");
         PoolInfo storage pool = poolInfo[_pid];
         IERC20 lpToken = pool.lpToken;
@@ -1753,16 +1894,43 @@ contract MasterChef is Ownable {
         view
         returns (uint256)
     {
-        if (_to <= bonusEndBlock) {
-            return _to.sub(_from).mul(BONUS_MULTIPLIER);
-        } else if (_from >= bonusEndBlock) {
-            return _to.sub(_from);
-        } else {
+        for (uint8 epochId = 4; epochId >= 1; --epochId) {
+            if (_to >= epochEndBlocks[epochId - 1]) {
+                if (_from >= epochEndBlocks[epochId - 1])
+                    return _to.sub(_from).mul(epochRewardMultiplers[epochId]);
+                uint256 multiplier = _to.sub(epochEndBlocks[epochId - 1]).mul(
+                    epochRewardMultiplers[epochId]
+                );
+                if (epochId == 1)
             return
-                bonusEndBlock.sub(_from).mul(BONUS_MULTIPLIER).add(
-                    _to.sub(bonusEndBlock)
+                        multiplier.add(
+                            epochEndBlocks[0].sub(_from).mul(
+                                epochRewardMultiplers[0]
+                            )
+                        );
+                for (epochId = epochId - 1; epochId >= 1; --epochId) {
+                    if (_from >= epochEndBlocks[epochId - 1])
+                        return
+                            multiplier.add(
+                                epochEndBlocks[epochId].sub(_from).mul(
+                                    epochRewardMultiplers[epochId]
+                                )
+                            );
+                    multiplier = multiplier.add(
+                        epochEndBlocks[epochId]
+                            .sub(epochEndBlocks[epochId - 1])
+                            .mul(epochRewardMultiplers[epochId])
+                    );
+                }
+            return
+                    multiplier.add(
+                        epochEndBlocks[0].sub(_from).mul(
+                            epochRewardMultiplers[0]
+                        )
                 );
         }
+    }
+        return _to.sub(_from).mul(epochRewardMultiplers[0]);
     }
 
     // View function to see pending SUSHIs on frontend.
@@ -1780,6 +1948,7 @@ contract MasterChef is Ownable {
                 pool.lastRewardBlock,
                 block.number
             );
+            if (totalAllocPoint > 0) {
             uint256 sushiReward = multiplier
                 .mul(sushiPerBlock)
                 .mul(pool.allocPoint)
@@ -1787,6 +1956,7 @@ contract MasterChef is Ownable {
             accSushiPerShare = accSushiPerShare.add(
                 sushiReward.mul(1e12).div(lpSupply)
             );
+        }
         }
         return user.amount.mul(accSushiPerShare).div(1e12).sub(user.rewardDebt);
     }
@@ -1810,16 +1980,22 @@ contract MasterChef is Ownable {
             pool.lastRewardBlock = block.number;
             return;
         }
+        if (!pool.isStarted) {
+            pool.isStarted = true;
+            totalAllocPoint = totalAllocPoint.add(pool.allocPoint);
+        }
         uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
+        if (totalAllocPoint > 0) {
         uint256 sushiReward = multiplier
             .mul(sushiPerBlock)
             .mul(pool.allocPoint)
             .div(totalAllocPoint);
-        sushi.mint(devaddr, sushiReward.div(10));
-        sushi.mint(address(this), sushiReward);
+            safeSushiMint(devaddr, sushiReward.div(9));
+            safeSushiMint(address(this), sushiReward);
         pool.accSushiPerShare = pool.accSushiPerShare.add(
             sushiReward.mul(1e12).div(lpSupply)
         );
+        }
         pool.lastRewardBlock = block.number;
     }
 
@@ -1834,14 +2010,21 @@ contract MasterChef is Ownable {
                 .mul(pool.accSushiPerShare)
                 .div(1e12)
                 .sub(user.rewardDebt);
+            if (pending > 0) {
+                user.accumulatedStakingPower = user.accumulatedStakingPower.add(
+                    pending
+                );
             safeSushiTransfer(msg.sender, pending);
         }
+        }
+        if (_amount > 0) {
         pool.lpToken.safeTransferFrom(
             address(msg.sender),
             address(this),
             _amount
         );
         user.amount = user.amount.add(_amount);
+        }
         user.rewardDebt = user.amount.mul(pool.accSushiPerShare).div(1e12);
         emit Deposit(msg.sender, _pid, _amount);
     }
@@ -1855,10 +2038,17 @@ contract MasterChef is Ownable {
         uint256 pending = user.amount.mul(pool.accSushiPerShare).div(1e12).sub(
             user.rewardDebt
         );
+        if (pending > 0) {
+            user.accumulatedStakingPower = user.accumulatedStakingPower.add(
+                pending
+            );
         safeSushiTransfer(msg.sender, pending);
+        }
+        if (_amount > 0) {
         user.amount = user.amount.sub(_amount);
+            pool.lpToken.safeTransfer(address(msg.sender), _amount);
+        }
         user.rewardDebt = user.amount.mul(pool.accSushiPerShare).div(1e12);
-        pool.lpToken.safeTransfer(address(msg.sender), _amount);
         emit Withdraw(msg.sender, _pid, _amount);
     }
 
@@ -1870,6 +2060,19 @@ contract MasterChef is Ownable {
         emit EmergencyWithdraw(msg.sender, _pid, user.amount);
         user.amount = 0;
         user.rewardDebt = 0;
+    }
+
+    // Safe sushi mint, ensure it is never over cap and we are the current owner.
+    function safeSushiMint(address _to, uint256 _amount) internal {
+        if (sushi.minters(address(this)) && _to != address(0)) {
+            uint256 totalSupply = sushi.totalSupply();
+            uint256 cap = sushi.cap();
+            if (totalSupply.add(_amount) > cap) {
+                sushi.mint(_to, cap.sub(totalSupply));
+            } else {
+                sushi.mint(_to, _amount);
+            }
+        }
     }
 
     // Safe sushi transfer function, just in case if rounding error causes pool to not have enough SUSHIs.
@@ -1886,5 +2089,24 @@ contract MasterChef is Ownable {
     function dev(address _devaddr) public {
         require(msg.sender == devaddr, "dev: wut?");
         devaddr = _devaddr;
+    }
+
+    // This function allows governance to take unsupported tokens out of the contract, since this pool exists longer than the other pools.
+    // This is in an effort to make someone whole, should they seriously mess up.
+    // There is no guarantee governance will vote to return these.
+    // It also allows for removal of airdropped tokens.
+    function governanceRecoverUnsupported(
+        IERC20 _token,
+        uint256 amount,
+        address to
+    ) external onlyOwner {
+        uint256 length = poolInfo.length;
+        for (uint256 pid = 0; pid < length; ++pid) {
+            PoolInfo storage pool = poolInfo[pid];
+            // cant take staked asset
+            require(_token != pool.lpToken, "!pool.lpToken");
+        }
+        // transfer to
+        _token.safeTransfer(to, amount);
     }
 }
